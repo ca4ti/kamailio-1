@@ -78,6 +78,7 @@
 #define DS_ALG_CALLLOAD 10
 #define DS_ALG_RELWEIGHT 11
 #define DS_ALG_PARALLEL 12
+#define DS_ALG_LATENCY 13
 
 /* increment call load */
 #define DS_LOAD_INC(dgrp, didx) do { \
@@ -2056,7 +2057,7 @@ int ds_select_dst_limit(sip_msg_t *msg, int set, int alg, uint32_t limit,
 		}
 	}
 
-	LM_DBG("selected target destinations: %d\n", vstate.cnt);
+	LM_NOTICE("selected target destinations: %d\n", vstate.cnt);
 
 	return ret;
 }
@@ -2164,6 +2165,7 @@ int ds_manage_routes(sip_msg_t *msg, ds_select_state_t *rstate)
 		case DS_ALG_SERIAL: /* 8 - use always first entry */
 			hash = 0;
 			break;
+
 		case DS_ALG_WEIGHT: /* 9 - weight based distribution */
 			lock_get(&idx->lock);
 			hash = idx->wlist[idx->wlast];
@@ -2205,6 +2207,41 @@ int ds_manage_routes(sip_msg_t *msg, ds_select_state_t *rstate)
 			break;
 		case DS_ALG_PARALLEL: /* 12 - parallel dispatching */
 			hash = 0;
+			break;
+		case DS_ALG_LATENCY: /* 13 - latency optimized round-robin with failover */
+			hash = idx->last;
+			ulast = 1;
+			int y = 0;
+			int z = hash;
+			int active_priority = 0;
+			for (y=0; y<idx->nr ;y++) {
+				int latency_proirity_handicap = 0;
+				int gw_priority = idx->dlist[z].priority;
+				int gw_latency = idx->dlist[z].latency_stats.estimate;
+				int gw_inactive = ds_skip_dst(idx->dlist[z].flags);
+				if (!gw_inactive) {
+					if (gw_latency > gw_priority && gw_priority > 0)
+						latency_proirity_handicap = gw_latency / gw_priority;
+					idx->dlist[z].attrs.rpriority = gw_priority - latency_proirity_handicap;
+					if (idx->dlist[z].attrs.rpriority < 1 && gw_priority > 0)
+						idx->dlist[z].attrs.rpriority = 1;
+					if (idx->dlist[z].attrs.rpriority > active_priority) {
+						hash = z;
+						active_priority = idx->dlist[z].attrs.rpriority;
+					}
+					LM_NOTICE("[active]idx[%d]uri[%.*s]priority[%d-%d=%d]latency[%dms]flag[%d]\n",
+						z, idx->dlist[z].uri.len, idx->dlist[z].uri.s,
+						gw_priority, latency_proirity_handicap,
+						idx->dlist[z].attrs.rpriority, gw_latency, idx->dlist[z].flags);
+				} else {
+					LM_NOTICE("[inactive]idx[%d]uri[%.*s]priority[%d]latency[%dms]flag[%d]",
+						z, idx->dlist[z].uri.len, idx->dlist[z].uri.s,
+						gw_priority, gw_latency, idx->dlist[z].flags);
+				}
+				z = (z + 1) % idx->nr;
+			}
+			idx->last = (hash + 1) % idx->nr;
+			LM_NOTICE("priority[%d]gateway_selected[%d]next_index[%d]\n", active_priority, hash, idx->last);
 			break;
 		default:
 			LM_WARN("algo %d not implemented - using first entry...\n",
